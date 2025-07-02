@@ -11,6 +11,8 @@ A collection of scripts and tools to streamline repetitive and manual tasks. Thi
 - Found Safely download sensitive files from specified AWS S3 buckets.
 - Built-in best practices for secure handling of credentials and logs.
 
+### Branch.io Open redirect vulnerability exploitation code
+
 ### 🔧 Upcoming Additions
 - More automation scripts will be added over time to improve efficiency and reduce manual effort across different tools and systems.
 
