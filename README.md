@@ -7,7 +7,7 @@ A collection of scripts and tools to streamline repetitive and manual tasks. Thi
 ### ✅ Bulk JIRA Ticket Management
 - Automatically close or update multiple JIRA tickets in one go.
 
-### 🔐 S3 Sensitive File Downloader
+### 🔐 S3 For Bugbounty
 - Found Safely download sensitive files from specified AWS S3 buckets.
 - Built-in best practices for secure handling of credentials and logs.
 
