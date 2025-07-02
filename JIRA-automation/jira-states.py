@@ -2,7 +2,7 @@ from jira import JIRA
 
 # --- Configuration ---
 JIRA_URL = 'https://xyZ.atlassian.net'
-EMAIL = 'anurag@xyz.com'      # Your Atlassian email
+EMAIL = 'email@xyz.com'      # Your Atlassian email
 API_TOKEN = 'JIRA-TOKEN'
 ISSUE_KEY = 'ISSUE_ID'                # Replace with a real issue key from your filter
 
