@@ -1,0 +1,171 @@
+Project: AWS Burp Tunnel Manager (macOS)
+Language: Python 3.8+
+Output: Single executable Python script named `aws_burp_tunnel_manager.py`
+Extras: Provide a `README.md` file (separate deliverable) describing usage, prerequisites, and verification steps.
+
+GOAL
+----
+Create an interactive, production-quality Python CLI tool that automates the following workflow on macOS:
+- Lets the user select an AWS deployment region (showing a numbered list of all available regions).
+- Lets the user select an existing AWS CLI profile or enter new AWS access keys and create a new profile.
+- Creates and imports a local SSH keypair into EC2 (name based on timestamp).
+- Creates a security group that:
+  - Allows SSH (port 22) limited to the user's public IP.
+  - Allows a user-specified public TCP port (default 9000) from a user-specified CIDR (company IP or 0.0.0.0/0).
+- Finds a recent Ubuntu AMI in the chosen region, launches a free-tier compatible EC2 instance (default `t3.micro`) with the created keypair and security group.
+- Allocates an Elastic IP (static public IP), associates it to the instance, and prints the Elastic IP (this is the IP the company will whitelist).
+- Enables `GatewayPorts yes` on the EC2 instance (so `ssh -R 0.0.0.0:REMOTE:local` can bind to external interface).
+- Starts a reverse SSH tunnel from the user’s macOS machine to the EC2 so that `ELASTIC_IP:REMOTE_PORT` forwards to `localhost:LOCAL_BURP_PORT`. Default mapping: `ELASTIC_IP:9000 -> localhost:8080`.
+- Supervises the SSH tunnel:
+  - Tries to establish the tunnel up to 3 times on startup if it fails.
+  - Once running, continuously monitors it and if it dies, automatically attempts up to 3 reconnects before failing and triggering user-visible error text.
+  - While the tunnel is active, the program provides an interactive prompt. On typing `exit`, the program gracefully tears down the tunnel and runs the cleanup routine.
+- Cleanup routine terminates EC2, disassociates/releases the Elastic IP, deletes the imported keypair on AWS, deletes the created security group, and removes local key files created by the program — all with a progress bar and percentage updates.
+- Program prints explicit, human-readable, step-by-step messages for each action (e.g., “Creating EC2 instance…”, “Allocating Elastic IP…”, “Associating IP…”, “Enabling GatewayPorts…”, “Starting reverse tunnel…”, “Tunnel connected ✅”, “Attempting reconnect (2/3)…”, “Cleanup: Terminating instance (25%)”, etc.)
+- Program must be safe: never hardcode credentials, always confirm destructive actions, and always show the exact AWS calls it will perform (log them), and require a final user confirmation before creating resources.
+
+REQUIREMENTS & BEHAVIOR
+-----------------------
+1. Dependencies:
+   - `boto3` (AWS SDK)
+   - `botocore`
+   - `paramiko` (for remote command execution)
+   - `rich` (for UI, progress bars, and status)
+   - standard Python libs: `subprocess`, `socket`, `configparser`, `pathlib`, `time`, `uuid`, `os`, `sys`
+   - The script must run on macOS; use local `ssh` for the tunnel spawn or `autossh` if detected. If `autossh` is present, provide an option to use it for the persistent tunnel.
+
+2. Authentication:
+   - The script lists local AWS CLI profiles (from `boto3.Session().available_profiles`) and offers a "Create new profile" option.
+   - If user chooses new profile, prompt for Access Key ID, Secret Access Key, and desired profile name. Save credentials to `~/.aws/credentials` and `~/.aws/config` with region.
+   - The script must never print secret keys to logs. If a profile is selected, use `boto3.Session(profile_name=...)`. If credentials are provided interactively, use `boto3.Session(profile_name=..., region_name=...)` after saving.
+
+3. Region selection:
+   - Query `ec2.describe_regions()` to list and present all AWS regions.
+   - Allow the user to choose one. Create a `boto3.Session` bound to that region.
+
+4. Network & ports:
+   - Prompt for `LOCAL_BURP_PORT` (default 8080) and `REMOTE_PORT` (default 9000).
+   - Detect the user's public IP automatically (try `https://ifconfig.me/ip`); if detection fails, ask the user to input their public IP.
+   - Prompt whether to restrict remote port to a specific CIDR (recommended) or open to `0.0.0.0/0`. If the latter, display a strong warning.
+
+5. EC2 launch and Elastic IP:
+   - Find a modern Ubuntu AMI (Ubuntu 20.04 or 22.04) using Canonical owner (owner id `099720109477`) and AMI name pattern, pick the latest by CreationDate.
+   - Create security group in the default VPC (or first VPC returned) with the ingress rules described above.
+   - Create/import an SSH keypair:
+     - Generate a local ed25519 key pair at `~/.ssh/burp_tunnel_<timestamp>` (private and `.pub`) and import the public key into EC2 `import_key_pair`.
+   - Launch a `t3.micro` (or `t2.micro` as fallback) instance with the keypair and security group.
+   - Wait until the instance is running; display progress percentages (e.g., 0% -> 20% -> 40% etc.) using `rich.progress`.
+   - Allocate and associate an Elastic IP (`allocate_address(Domain='vpc')` and `associate_address(InstanceId=...)`).
+
+6. Configure EC2 to accept remote binding:
+   - Use `paramiko` SSH client with the generated key to connect to the instance and run:
+     ```
+     sudo sed -i 's/^#\?GatewayPorts.*/GatewayPorts yes/' /etc/ssh/sshd_config
+     sudo systemctl restart sshd || sudo service ssh restart
+     ```
+   - Confirm the command succeeded and print output.
+
+7. Starting the reverse SSH tunnel:
+   - Build the SSH command:
+     ```
+     ssh -i "<private_key_path>" -o "ServerAliveInterval=60" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes" -R 0.0.0.0:<REMOTE_PORT>:localhost:<LOCAL_BURP_PORT> ubuntu@<ELASTIC_IP> -N
+     ```
+   - Use `subprocess.Popen` to run the SSH command and monitor its stdout/stderr.
+   - On startup, wait a short period to detect immediate failures. If the process exits, read stderr and attempt up to 3 full reconnection attempts. Each attempt prints a message and progress.
+   - While connected, provide an interactive prompt where the user can type commands:
+     - `exit` → gracefully terminate the tunnel and trigger cleanup.
+     - empty or unknown → print hints (type `exit` to cleanup).
+   - If the connection dies unexpectedly, attempt up to 3 automatic reconnects; if all fail, print a clear error and automatically trigger cleanup.
+
+8. Supervising & reconnect logic:
+   - On any SSH process failure, capture, log and show the stderr. Attempt restarts with a small backoff (e.g., 3s, 6s, then 12s).
+   - Count and display the attempt number and reason for failure.
+
+9. Cleanup:
+   - When cleanup is triggered (user types `exit` or tunnel failed unrecoverably), run a cleanup routine that:
+     - Terminates the EC2 instance and waits for it to be terminated.
+     - Disassociates and releases the Elastic IP.
+     - Deletes the imported key pair from EC2.
+     - Deletes the created security group.
+     - Deletes the local private key and public key files created by the program.
+   - Use `rich.progress` to show a multi-step cleanup progress bar where each step adjusts the percentage and displays textual updates (e.g., `25% Terminating instance`, `50% Releasing Elastic IP`, etc.).
+   - The cleanup must be robust: if a resource was not created or already deleted, skip and show a warning; continue trying to clean other resources.
+
+10. Logging & messages:
+    - All actions are echoed to the terminal with human-friendly text, including the exact AWS methods that will be used (but never print secret keys).
+    - For each major phase, print a small summary table with the state (key name, security group id, instance id, allocated elastic ip).
+    - Error messages must include the AWS response or SSH stderr to help debugging.
+
+11. Verification steps (displayed to the user):
+    - Show commands that the user or admins can run to verify the tunnel is working:
+      - From EC2: `curl -v http://127.0.0.1:<REMOTE_PORT>/` — should show a request in Burp.
+      - From anywhere: `curl -v http://<ELASTIC_IP>:<REMOTE_PORT>/` — should appear in Burp.
+      - Ask company to confirm the source IP of incoming connections equals the Elastic IP shown.
+    - Provide a small test routine in the script that the user can run (optional prompt) to `curl` the EC2 endpoint once the tunnel is up and display the response status or timeout.
+
+12. UX & Terminal UI:
+    - Use `rich` to display clean progress bars, tables, panels, and colored messages.
+    - At deployment time, show percentage progression across the whole deployment (e.g., 5 steps → show 0%, 20%, 40%, 60%, 80%, 100%). Use progress bar labels like:
+      - `[10%] Creating SSH keypair and importing`
+      - `[30%] Creating security group`
+      - `[50%] Launching EC2 instance`
+      - `[70%] Allocating & associating Elastic IP`
+      - `[100%] Finalizing and enabling GatewayPorts`
+    - During cleanup, show similar percentage progression in reverse.
+
+13. Safety & confirmations:
+    - Before making any AWS changes, explicitly print a checklist of actions the script will take and require explicit confirmation (`yes`) to proceed.
+    - If the script detects that the chosen profile has limited permissions (AWS returns `UnauthorizedOperation`), abort with clear guidance.
+    - If any blocking error occurs, display the error and give options: abort + cleanup or retry.
+
+14. Deliverables (what the script must produce and what to commit to the repo):
+    - A single executable Python script `aws_burp_tunnel_manager.py` containing clear inline comments and docstrings.
+    - A second file `README.md` explaining prerequisites, setup, how to run, and common troubleshooting steps and verification instructions (example tests).
+    - The script must print at the end a short summary with the Elastic IP and example string to provide to the company: `ELASTIC_IP:REMOTE_PORT`.
+    - The script must be licensed under MIT and include a short header comment indicating author, license, and usage notes.
+
+15. Coding style & quality:
+    - Write clear, modular functions (e.g., `select_profile()`, `list_regions()`, `create_keypair()`, `create_security_group()`, `launch_instance()`, `allocate_eip()`, `enable_gateway_ports()`, `start_tunnel()`, `supervise_tunnel()`, `cleanup()`).
+    - Include docstrings and helpful comments.
+    - Use typed function signatures where appropriate.
+    - Handle exceptions with `try/except` and provide actionable messages.
+    - Keep secrets out of logs.
+
+16. Tests & manual verification:
+    - Provide a short "dry-run" mode (`--dry-run`) that prints the exact AWS calls it would make without executing them (useful for review).
+    - Provide a `--no-cleanup` option to leave resources running (for debugging), with an extra confirmation prompt when used.
+    - Document testing instructions in the README.
+
+USER INTERACTION EXAMPLES
+-------------------------
+- On start the program prints:
+  - Header panel: "AWS Burp Tunnel Manager — macOS"
+  - Lists available AWS profiles and numbered regions
+  - After the user picks region & profile, prints the planned actions and asks "Proceed? (yes/no)"
+- During deployment:
+  - Show step-by-step messages with percentages and a progress bar.
+  - Print the Elastic IP on success, e.g. "Elastic IP allocated: 3.120.45.10 — give this to the company (3.120.45.10:9000)".
+- While tunnel is running:
+  - Print "Tunnel connected ✅ — type `exit` to teardown and cleanup".
+  - If tunnel disconnects, print "Tunnel disconnected — attempting reconnect (1/3)" and show stderr output when applicable.
+- On `exit`:
+  - Clean up and show a cleanup progress bar and final success message.
+
+README
+------
+- Include step-by-step installation of dependencies.
+- Show how to configure AWS credentials or use existing profiles.
+- Provide example run commands and sample output.
+- Document verification steps (curl commands to test).
+- Explain the dry-run and no-cleanup options.
+- WARNING: show security guidance about exposing ports and using this only for authorized testing.
+
+NON-FUNCTIONAL REQUIREMENTS
+---------------------------
+- Make the code robust and fault tolerant.
+- Use descriptive, user-friendly messages.
+- Keep the code under 500–1000 lines and well organized.
+- Avoid hardcoding any sensitive info; always prompt or read from environment/profile.
+
+Deliver the final `aws_burp_tunnel_manager.py` and `README.md` as plain text files suitable for a GitHub repo.  Ensure the prompt itself is verbose, precise, and captures all corner cases for a high-quality implementation.
+
