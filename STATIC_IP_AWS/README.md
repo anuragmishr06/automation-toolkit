@@ -65,17 +65,32 @@ After deployment, the script prints the Elastic IP. Provide this IP (and the rem
 ## Verify the tunnel
 Once the tunnel is up, run these checks:
 
-From the EC2 instance (SSH into the instance with the key the script created):
+From the terminal:
 ```bash
-curl -v http://127.0.0.1:9000/
+aws ssm start-session   --target <PASTE-INSTANCE-ID>  --document-name AWS-StartPortForwardingSessionToRemoteHost   --parameters '{"host":["127.0.0.1"],"portNumber":["3128"],"localPortNumber":["3128"]}'   --region ap-south-1   --profile static-ip
 ```
-From anywhere:
+From another terminal:
 ```bash
-curl -v http://<ELASTIC_IP>:9000/
+nc -vz 127.0.0.1 3128 || true
 ```
 
-You should see the request appear in Burp Suite if the tunnel is working correctly.
-Ask the company to confirm that incoming connections originate from the Elastic IP printed by the script.
+```bash
+curl -sS -x http://127.0.0.1:3128 https://ifconfig.me && echo
+```
+
+You will see the Elastic IP value if the static IP is setup properly. 
+
+# Setup Upstream Proxy in burp:
+Go to proxy settings -> user -> Network -> Connections -> Upstream Proxy server
+
+Destination host: *
+Proxy host: 127.0.0.1
+Proxy port: 3128
+Authentication type: None
+
+
+After this You should see the request appear in Burp Suite if the tunnel is working correctly.
+
 
 ## Security notes
 - Do **not** expose remote port to `0.0.0.0/0` unless absolutely necessary. Prefer restricting to the company's CIDR.
